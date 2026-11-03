@@ -2,21 +2,15 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : National Yunlin University of Science and Technology (NYUST)
-  *                   Department of Electronic Engineering
-  *                   Course: Microcomputer Principles and Applications
-  *                   Project: Smart Instant Noodle Guard System (Anti-theft FSM)
-  *                   Target : STM32G474RETx (NUCLEO-G474RE) @ 170MHz
-  *                   Design : CubeMX Structure with CMSIS Direct Register Operations
+  * @brief          : 國立雲林科技大學 電子工程系「微計算機原理及應用」專案
+  *                   智慧防盜泡麵微波爐守護系統 (STM32G474RETx @ 170MHz)
+  *                   架構：CMSIS 純暫存器位元操作 + CubeMX 框架相容
+  *                   更新功能：警報解除時強制檢查 PA1 是否插回接地
   ******************************************************************************
   * @attention
   *
   * Copyright (c) 2026 STMicroelectronics.
   * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
   *
   ******************************************************************************
   */
@@ -61,19 +55,19 @@ static volatile SystemState_t current_state = STATE_IDLE;
 static char system_password[16] = "12345";
 static uint8_t failed_attempts = 0;
 
-/* USART2 Ring Buffer */
+/* USART2 環形緩衝區 */
 static volatile uint8_t rx_ring_buffer[UART_RX_BUFFER_SIZE];
 static volatile uint16_t rx_head = 0;
 static volatile uint16_t rx_tail = 0;
 
-/* CLI Line Buffer */
+/* CLI 命令行緩衝區 */
 static char cli_line[CLI_LINE_MAX_LEN];
 static uint16_t cli_index = 0;
 
-/* EXTI13 Event Flag */
+/* EXTI13 按鍵事件旗標 */
 static volatile bool exti13_flag = false;
 
-/* Buzzer Tone Timer */
+/* 蜂鳴器發聲剩餘毫秒數 */
 static volatile uint32_t buzzer_beep_remaining_ms = 0;
 /* USER CODE END PV */
 
@@ -84,7 +78,10 @@ static void MX_USART2_UART_Init(void);
 /* USER CODE BEGIN PFP */
 static void UART_SendChar(char ch);
 static void UART_SendString(const char *str);
+static void Buzzer_Tone_Toggle(void);
+static void Buzzer_Mute(void);
 static void Buzzer_TriggerTone(uint32_t duration_ms);
+static void Trigger_Alarm(const char *reason);
 static void Process_CLI_Command(char *cmd);
 /* USER CODE END PFP */
 
@@ -92,16 +89,16 @@ static void Process_CLI_Command(char *cmd);
 /* USER CODE BEGIN 0 */
 
 /**
-  * @brief  Transmit a single character via USART2 using CMSIS TDR register
+  * @brief  透過 CMSIS 暫存器 TDR 發送單一字元
   */
 static void UART_SendChar(char ch)
 {
-    while (!(USART2->ISR & USART_ISR_TXE_TXFNF)); // Wait until TX FIFO / register empty
+    while (!(USART2->ISR & USART_ISR_TXE_TXFNF)); // 等待發送資料暫存器為空
     USART2->TDR = (uint8_t)ch;
 }
 
 /**
-  * @brief  Transmit a null-terminated string via USART2
+  * @brief  透過 USART2 發送字串
   */
 static void UART_SendString(const char *str)
 {
@@ -114,7 +111,26 @@ static void UART_SendString(const char *str)
 }
 
 /**
-  * @brief  Schedule a non-blocking confirmation beep
+  * @brief  PB1 輸出方波震盪（約 2.5kHz，兼顧有源與無源蜂鳴器）
+  */
+static void Buzzer_Tone_Toggle(void)
+{
+    GPIOB->BSRR = (1U << 1);            // PB1 拉高
+    for (volatile int d = 0; d < 700; d++); // 延遲約 200us
+    GPIOB->BSRR = (1U << (1 + 16));     // PB1 拉低
+    for (volatile int d = 0; d < 700; d++); // 延遲約 200us
+}
+
+/**
+  * @brief  蜂鳴器靜音
+  */
+static void Buzzer_Mute(void)
+{
+    GPIOB->BSRR = (1U << (1 + 16));     // 拉低靜音
+}
+
+/**
+  * @brief  排程提示音
   */
 static void Buzzer_TriggerTone(uint32_t duration_ms)
 {
@@ -122,7 +138,25 @@ static void Buzzer_TriggerTone(uint32_t duration_ms)
 }
 
 /**
-  * @brief  HAL EXTI Falling Edge Callback for PC13 (Blue Button)
+  * @brief  觸發警報（只印出一次警報訊息，不狂跳洗版）
+  */
+static void Trigger_Alarm(const char *reason)
+{
+    current_state = STATE_ALARM;
+    UART_SendString("\r\n\r\n=======================================================\r\n");
+    UART_SendString(" [警報啟動] 偵測到非法操作！\r\n");
+    if (reason != NULL) {
+        UART_SendString(" 原因：");
+        UART_SendString(reason);
+        UART_SendString("\r\n");
+    }
+    UART_SendString(" 警示狀態：紅燈恆亮、蜂鳴器狂鳴。\r\n");
+    UART_SendString(" 解除流程：【必須先插回 PA1 感測線（接地）】後，再輸入 'RESET'！\r\n");
+    UART_SendString("=======================================================\r\n> ");
+}
+
+/**
+  * @brief  HAL EXTI 下降緣中斷回呼（PC13 板載藍色按鈕）
   */
 void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
@@ -132,21 +166,22 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 }
 
 /**
-  * @brief  Parse and execute CLI commands
+  * @brief  CLI 命令解析器（中文介面）
   */
 static void Process_CLI_Command(char *cmd)
 {
     while (*cmd == ' ') cmd++;
     if (*cmd == '\0') return;
 
+    /* 查詢狀態指令 */
     if (strncmp(cmd, "STATUS", 6) == 0) {
-        char status_msg[128];
-        const char *state_names[] = {"IDLE", "ARMED", "UNLOCKED", "ALARM"};
+        char status_msg[160];
+        const char *state_names[] = {"待機 (IDLE)", "守護上鎖 (ARMED)", "授權解鎖 (UNLOCKED)", "警報中 (ALARM)"};
         uint8_t pa1_val = (GPIOA->IDR & (1U << 1)) ? 1 : 0;
         snprintf(status_msg, sizeof(status_msg),
-                 "\n[STATUS] State: %s | Tray Sensor PA1: %d (%s) | Failed Pwd: %d\n> ",
+                 "\n[系統狀態] 模式: %s | 托盤感測線(PA1): %d (%s) | 密碼錯誤次數: %d\n> ",
                  state_names[current_state], pa1_val,
-                 pa1_val == 0 ? "Noodle Present" : "Empty", failed_attempts);
+                 pa1_val == 0 ? "泡麵在位(接地)" : "托盤拔除(空)", failed_attempts);
         UART_SendString(status_msg);
         return;
     }
@@ -157,9 +192,9 @@ static void Process_CLI_Command(char *cmd)
                 char *arg = cmd + 4;
                 while (*arg == ' ') arg++;
 
-                /* Check Tray Sensor: PA1 must be connected to GND (low = 0) */
+                /* 檢查托盤感測線 PA1 是否接地（低電位 0 為在位） */
                 if (GPIOA->IDR & (1U << 1)) {
-                    UART_SendString("\n[ERROR] Tray is empty (PA1 is HIGH)! Place instant noodles before locking.\n> ");
+                    UART_SendString("\n[錯誤] 托盤為空（PA1 未接地）！請先放置泡麵接好感測線後再上鎖。\n> ");
                 } else {
                     if (strlen(arg) > 0) {
                         strncpy(system_password, arg, sizeof(system_password) - 1);
@@ -167,11 +202,12 @@ static void Process_CLI_Command(char *cmd)
                     }
                     failed_attempts = 0;
                     current_state = STATE_ARMED;
-                    Buzzer_TriggerTone(100);
-                    UART_SendString("\n[SYSTEM] Lock Confirmed. System entered STATE_ARMED.\n> ");
+                    Buzzer_TriggerTone(120);
+                    UART_SendString("\n[系統通知] 上鎖完成，系統進入【守護上鎖模式】。\n");
+                    UART_SendString("[提示] 綠燈規律閃爍中。解鎖請直接輸入密碼。\n> ");
                 }
             } else {
-                UART_SendString("\n[IDLE CMD] Use 'LOCK <password>' to arm system or 'STATUS'.\n> ");
+                UART_SendString("\n[待機指令] 輸入 'LOCK <密碼>' 進行上鎖，或輸入 'STATUS' 查看狀態。\n> ");
             }
             break;
 
@@ -179,24 +215,22 @@ static void Process_CLI_Command(char *cmd)
             if (strcmp(cmd, system_password) == 0) {
                 failed_attempts = 0;
                 current_state = STATE_UNLOCKED;
-                Buzzer_TriggerTone(200);
-                UART_SendString("\n[AUTH SUCCESS] Password accepted! Microwave door unlocked.\n"
-                                "[INFO] Safe to open door (PC13) and remove noodle tray (PA1).\n> ");
+                Buzzer_TriggerTone(200); // 授權成功嗶一聲
+                UART_SendString("\n[認證成功] 密碼正確！微波爐門已解鎖（綠燈恆亮）。\n");
+                UART_SendString("[取餐提示] 請開門並拔開 PA1 感測線取出泡麵。\n> ");
             } else {
                 failed_attempts++;
-                UART_SendString("\n[AUTH FAILED] Incorrect password!\n");
+                UART_SendString("\n[認證失敗] 密碼錯誤！\n");
                 if (failed_attempts >= 3) {
-                    UART_SendString("[ALERT] 3 Failed attempts! Intrusion threshold reached!\n");
+                    /* 連續輸錯 3 次：短響兩聲警告後進入警報 */
                     for (int k = 0; k < 2; k++) {
-                        GPIOB->BSRR = (1U << 1);
-                        HAL_Delay(80);
-                        GPIOB->BSRR = (1U << (1 + 16));
+                        for (int t = 0; t < 200; t++) Buzzer_Tone_Toggle();
                         HAL_Delay(80);
                     }
-                    current_state = STATE_ALARM;
+                    Trigger_Alarm("密碼連續輸錯達 3 次！");
                 } else {
                     char err_msg[64];
-                    snprintf(err_msg, sizeof(err_msg), "[WARNING] Attempts left: %d\n> ", 3 - failed_attempts);
+                    snprintf(err_msg, sizeof(err_msg), "[警告] 密碼剩餘嘗試次數：%d\n> ", 3 - failed_attempts);
                     UART_SendString(err_msg);
                     Buzzer_TriggerTone(80);
                 }
@@ -204,18 +238,25 @@ static void Process_CLI_Command(char *cmd)
             break;
 
         case STATE_UNLOCKED:
-            UART_SendString("\n[UNLOCKED] Please remove your noodles (disconnect PA1 wire) to finish.\n> ");
+            UART_SendString("\n[取餐中] 請拔開 PA1 感測線取出泡麵，取餐後系統將自動返回待機。\n> ");
             break;
 
         case STATE_ALARM:
             if (strcmp(cmd, "RESET") == 0) {
-                current_state = STATE_IDLE;
-                failed_attempts = 0;
-                GPIOB->BSRR = (1U << (0 + 16)); // Red LED OFF
-                GPIOB->BSRR = (1U << (1 + 16)); // Buzzer Mute
-                UART_SendString("\n[ALARM RESET] System reset complete. Returning to STATE_IDLE.\n> ");
+                /* 安全防護檢查：必須先將 PA1 感測線插回 GND（低電位 0）才能解除警報 */
+                if (GPIOA->IDR & (1U << 1)) {
+                    UART_SendString("\n[拒絕解除] 泡麵尚未歸位（PA1 仍為高電位/拔開狀態）！\r\n"
+                                    "[安全鎖定] 請先將 PA1 感測線插回 GND 接好，再輸入 'RESET'！\n> ");
+                    Buzzer_TriggerTone(80); // 警示嗶聲
+                } else {
+                    current_state = STATE_IDLE;
+                    failed_attempts = 0;
+                    GPIOB->BSRR = (1U << (0 + 16)); // 紅燈滅
+                    Buzzer_Mute();                  // 蜂鳴器停
+                    UART_SendString("\n\n[警報解除] 感測線已確認歸位，系統復原並返回【待機模式】。\n> ");
+                }
             } else {
-                UART_SendString("\n[SECURITY LOCKOUT] System under ALARM! Type 'RESET' to deactivate!\n> ");
+                UART_SendString("\n[警報中] 請先插回 PA1 感測線，再輸入 'RESET' 解除警報！\n> ");
             }
             break;
     }
@@ -253,30 +294,29 @@ int main(void)
   MX_GPIO_Init();
   MX_USART2_UART_Init();
   /* USER CODE BEGIN 2 */
-  /* Enable USART2 RXNE (Receive Data Register Not Empty) Interrupt via CMSIS */
+  /* 開啟 USART2 RXNE 暫存器接收中斷 */
   USART2->CR1 |= USART_CR1_RXNEIE_RXFNEIE;
 
-  /* Explicitly enable NVIC lines for USART2 and EXTI15_10 */
+  /* 設定並開啟 NVIC 中斷 */
   NVIC_SetPriority(USART2_IRQn, 1);
   NVIC_EnableIRQ(USART2_IRQn);
   NVIC_SetPriority(EXTI15_10_IRQn, 2);
   NVIC_EnableIRQ(EXTI15_10_IRQn);
 
-  /* Welcome Banner */
+  /* 開機提示字串 */
   UART_SendString("\r\n=======================================================\r\n");
-  UART_SendString("  NYUST EE - Microcomputer Principles & Applications\r\n");
-  UART_SendString("  Instant Noodle Anti-Theft Guard System (STM32G474RE)\r\n");
-  UART_SendString("  System Clock: 170 MHz | Architecture: CMSIS Register\r\n");
+  UART_SendString("  國立雲林科技大學 電子工程系「微計算機原理及應用」\r\n");
+  UART_SendString("  智慧防盜泡麵微波爐守護系統 (STM32G474RE)\r\n");
+  UART_SendString("  核心時脈: 170 MHz | 架構: CMSIS 純暫存器位元控制\r\n");
   UART_SendString("=======================================================\r\n");
-  UART_SendString("[IDLE] System Ready. Default Password: 12345\r\n");
-  UART_SendString("[HELP] Type 'LOCK <password>' to protect your meal.\r\n> ");
+  UART_SendString("[待機中] 系統已就緒。預設密碼: 12345\r\n");
+  UART_SendString("[操作引導] 請放妥泡麵(PA1接地)後輸入 'LOCK 密碼' 啟動守護。\r\n> ");
 
-  /* Non-blocking Timing Variables */
+  /* 非阻塞計時變數 */
   uint32_t last_tick_led = HAL_GetTick();
   uint32_t last_tick_alarm = HAL_GetTick();
-  uint32_t last_tick_alarm_msg = HAL_GetTick();
 
-  /* Software PWM Breathing parameters for PA5 */
+  /* PA5 綠燈呼吸燈參數 */
   const uint16_t pwm_period = 100;
   uint16_t duty_cycle = 0;
   int8_t duty_step = 1;
@@ -290,7 +330,7 @@ int main(void)
     uint32_t current_tick = HAL_GetTick();
 
     /* ========================================================================= */
-    /* 1. CLI Ring Buffer Parser with Echo & Backspace Handling                  */
+    /* 1. CLI 環形緩衝區字元接收、即時回顯與退格鍵處理                             */
     /* ========================================================================= */
     while (rx_head != rx_tail) {
         uint8_t ch = rx_ring_buffer[rx_tail];
@@ -306,42 +346,42 @@ int main(void)
             } else {
                 UART_SendString("> ");
             }
-        } else if (ch == '\b' || ch == 127) { // Handle Backspace / Delete
+        } else if (ch == '\b' || ch == 127) { // 處理退格鍵
             if (cli_index > 0) {
                 cli_index--;
                 UART_SendString("\b \b");
             }
         } else if (cli_index < (CLI_LINE_MAX_LEN - 1)) {
             cli_line[cli_index++] = (char)ch;
-            UART_SendChar((char)ch); // Interactive Terminal Echo
+            UART_SendChar((char)ch); // 即時字元回顯
         }
     }
 
     /* ========================================================================= */
-    /* 2. PC13 External Interrupt Event Handler                                  */
+    /* 2. PC13 板載按鈕（門開關中斷）事件處理                                    */
     /* ========================================================================= */
     if (exti13_flag) {
         exti13_flag = false;
         if (current_state == STATE_ARMED) {
-            UART_SendString("\r\n[SECURITY BREACH] Door Opened while ARMED without Authorization!\r\n");
-            current_state = STATE_ALARM;
+            Trigger_Alarm("未授權解鎖，強行開門（按下板載藍色按鈕 PC13）！");
         } else if (current_state == STATE_UNLOCKED) {
-            UART_SendString("\r\n[INFO] Microwave Door Opened. Please retrieve your meal.\r\n> ");
-            Buzzer_TriggerTone(50);
+            UART_SendString("\r\n[門已開啟] 微波爐門開啟，請取出泡麵。\r\n> ");
+            Buzzer_TriggerTone(60);
         } else if (current_state == STATE_IDLE) {
-            UART_SendString("\r\n[INFO] Microwave Door Opened (Standby).\r\n> ");
+            UART_SendString("\r\n[門已開啟] 系統處於待機模式。\r\n> ");
         }
     }
 
     /* ========================================================================= */
-    /* 3. Finite State Machine (FSM) Execution Loop                              */
+    /* 3. 有限狀態機 (FSM) 核心執行區                                            */
     /* ========================================================================= */
     switch (current_state) {
         case STATE_IDLE:
-            /* Turn off Red LED (PB0 = 0) */
+            /* PB0 紅燈滅、蜂鳴器靜音 */
             GPIOB->BSRR = (1U << (0 + 16));
+            if (buzzer_beep_remaining_ms == 0) Buzzer_Mute();
 
-            /* PA5 Software PWM Breathing Light */
+            /* PA5 綠燈非阻塞呼吸燈效果 */
             if (current_tick - last_pwm_update_tick >= 15) {
                 last_pwm_update_tick = current_tick;
                 duty_cycle += duty_step;
@@ -354,21 +394,21 @@ int main(void)
                 }
             }
 
-            /* Fast loop software PWM slice */
             for (uint16_t cycle = 0; cycle < pwm_period; cycle++) {
                 if (cycle < duty_cycle) {
-                    GPIOA->BSRR = (1U << 5);         // High
+                    GPIOA->BSRR = (1U << 5);         // 點亮 PA5
                 } else {
-                    GPIOA->BSRR = (1U << (5 + 16));  // Low
+                    GPIOA->BSRR = (1U << (5 + 16));  // 熄滅 PA5
                 }
             }
             break;
 
         case STATE_ARMED:
-            /* Turn off Red LED (PB0 = 0) */
+            /* PB0 紅燈滅、蜂鳴器靜音 */
             GPIOB->BSRR = (1U << (0 + 16));
+            if (buzzer_beep_remaining_ms == 0) Buzzer_Mute();
 
-            /* PA5 Green LED Blink @ 250ms interval */
+            /* PA5 綠燈每 250ms 規律閃爍 */
             if (current_tick - last_tick_led >= 250) {
                 last_tick_led = current_tick;
                 if (GPIOA->ODR & (1U << 5)) {
@@ -378,67 +418,56 @@ int main(void)
                 }
             }
 
-            /* Anti-theft Guard: Check PA1 Tray Sensor (拔開為 1) */
+            /* 托盤防盜感測：若 PA1 未經解鎖遭拔開變為高電位 1 */
             if (GPIOA->IDR & (1U << 1)) {
-                UART_SendString("\r\n[INTRUSION ALERT] Meal was pulled away unlawfully! Tray wire disconnected!\r\n");
-                current_state = STATE_ALARM;
+                Trigger_Alarm("泡麵遭偷竊！未經密碼解鎖，托盤感測線 (PA1) 遭直接拔開！");
             }
             break;
 
         case STATE_UNLOCKED:
-            /* PA5 Green LED Constant ON, PB0 Red LED OFF */
+            /* PA5 綠燈恆亮，PB0 紅燈滅 */
             GPIOA->BSRR = (1U << 5);
             GPIOB->BSRR = (1U << (0 + 16));
+            if (buzzer_beep_remaining_ms == 0) Buzzer_Mute();
 
-            /* Check if meal has been safely taken out (PA1 wire disconnected = 1) */
+            /* 授權取餐：主人拔開 PA1 感測線 */
             if (GPIOA->IDR & (1U << 1)) {
                 UART_SendString("\r\n=======================================================\r\n");
-                UART_SendString(" [BON APPETIT] Noodles retrieved safely! Enjoy your meal!\r\n");
+                UART_SendString(" [取餐完畢] 泡麵已安全取出，請慢用！\r\n");
                 UART_SendString("=======================================================\r\n");
-                Buzzer_TriggerTone(300);
-                HAL_Delay(350);
+                for (int t = 0; t < 600; t++) Buzzer_Tone_Toggle(); // 取餐長嗶一聲
                 current_state = STATE_IDLE;
-                UART_SendString("[IDLE] System returned to standby.\r\n> ");
+                UART_SendString("[待機中] 系統已自動返回待機模式。\r\n> ");
             }
             break;
 
         case STATE_ALARM:
-            /* PA5 Green LED OFF, PB0 Red LED Solid ON */
+            /* PA5 綠燈滅，PB0 紅燈恆亮 */
             GPIOA->BSRR = (1U << (5 + 16));
             GPIOB->BSRR = (1U << 0);
 
-            /* Intermittent 150ms buzzer oscillation cycle */
+            /* 300ms 間歇週期：150ms 狂鳴、150ms 靜音 */
             if ((current_tick - last_tick_alarm) >= 300) {
                 last_tick_alarm = current_tick;
             }
 
-            /* During the active 150ms half-cycle: toggle PB1 for ~2.5kHz square wave */
             if ((current_tick - last_tick_alarm) < 150) {
-                GPIOB->BSRR = (1U << 1);
-                for (volatile int d = 0; d < 80; d++);
-                GPIOB->BSRR = (1U << (1 + 16));
-                for (volatile int d = 0; d < 80; d++);
+                Buzzer_Tone_Toggle(); // 產生警報頻率方波
             } else {
-                GPIOB->BSRR = (1U << (1 + 16));
-            }
-
-            /* Periodic Warning Terminal Broadcast */
-            if (current_tick - last_tick_alarm_msg >= 2000) {
-                last_tick_alarm_msg = current_tick;
-                UART_SendString("\r\n[!!! SIREN ACTIVATED !!!] THEFT DETECTED! TYPE 'RESET' TO DEACTIVATE!\r\n> ");
+                Buzzer_Mute();        // 靜音
             }
             break;
     }
 
     /* ========================================================================= */
-    /* 4. Single Short Confirmation Beep Generator                               */
+    /* 4. 非警報狀態下的短嗶聲驅動                                               */
     /* ========================================================================= */
     if (buzzer_beep_remaining_ms > 0 && current_state != STATE_ALARM) {
-        GPIOB->BSRR = (1U << 1);
-        for (volatile int d = 0; d < 80; d++);
-        GPIOB->BSRR = (1U << (1 + 16));
-        for (volatile int d = 0; d < 80; d++);
+        Buzzer_Tone_Toggle();
         buzzer_beep_remaining_ms--;
+        if (buzzer_beep_remaining_ms == 0) {
+            Buzzer_Mute();
+        }
     }
 
     /* USER CODE END WHILE */
@@ -599,7 +628,7 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 /**
-  * @brief  USART2 RXNE Interrupt Hook (Called directly from stm32g4xx_it.c or custom handler)
+  * @brief  由 stm32g4xx_it.c 中的 USART2_IRQHandler 呼叫的暫存器中斷函式
   */
 void UART_RxInterrupt_Handler(void)
 {
@@ -613,7 +642,7 @@ void UART_RxInterrupt_Handler(void)
     }
 
     if (USART2->ISR & USART_ISR_ORE) {
-        USART2->ICR = USART_ICR_ORECF; // Clear Overrun Error
+        USART2->ICR = USART_ICR_ORECF; // 清除 Overrun Error
     }
 }
 /* USER CODE END 4 */
@@ -625,7 +654,6 @@ void UART_RxInterrupt_Handler(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
@@ -634,18 +662,9 @@ void Error_Handler(void)
 }
 
 #ifdef  USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
